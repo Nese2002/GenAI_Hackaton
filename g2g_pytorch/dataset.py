@@ -18,8 +18,9 @@ import torch
 from torch.utils.data import Dataset
 
 from .utility.data import Triplet, read_manifest, load_roll_bundle, HackathonDataset
+from .utility.metric import build_style_profile_from_bundles
 from .utility.pianoroll import NUM_PITCHES, T_PER_FRAGMENT
-from .models.unet import flatten_profile
+from .models.unet import flatten_profile, PROFILE_FLAT_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ class HackathonRollDataset(Dataset):
         self.num_pitches = num_pitches
         self.time_steps  = time_steps
         self.require_Y   = require_Y
-        self.profiles    = profiles or {}
+        self.profiles    = dict(profiles or {})   # local copy so we can extend it
         self.triplets: List[Triplet] = []
         skipped = 0
         for t in triplets:
@@ -105,6 +106,27 @@ class HackathonRollDataset(Dataset):
             self.triplets.append(t)
         self._skipped = skipped
 
+        # Pre-compute style profiles for styles not covered by style_profiles/.
+        # Training styles are typically absent from style_profiles/ (which only
+        # contains val/test styles). We aggregate Y bundles per style here so
+        # every item has a valid PROFILE_FLAT_DIM style tensor.
+        missing = {t.style_tgt for t in self.triplets
+                   if t.style_tgt not in self.profiles}
+        if missing:
+            style_bundles: Dict[str, List] = {}
+            for t in self.triplets:
+                if t.style_tgt in missing and t.Y_path:
+                    yp = self.root / t.Y_path
+                    if yp.exists():
+                        style_bundles.setdefault(t.style_tgt, []).append(str(yp))
+            for style, paths in style_bundles.items():
+                bundles = [load_roll_bundle(p) for p in paths]
+                prof = build_style_profile_from_bundles(bundles)
+                self.profiles[style] = flatten_profile(prof)
+            # Any style still missing (no Y files at all) → zero vector
+            for style in missing - set(self.profiles):
+                self.profiles[style] = torch.zeros(PROFILE_FLAT_DIM)
+
     def __len__(self) -> int:
         return len(self.triplets)
 
@@ -115,9 +137,9 @@ class HackathonRollDataset(Dataset):
         Z = bundle_to_input(load_roll_bundle(str(self.root / t.Z_path)),
                             self.num_pitches, self.time_steps)
 
-        # Style profile — use pre-loaded dict, fall back to zeros
+        # Style profile — always present after __init__ pre-computation
         style_flat = self.profiles.get(t.style_tgt,
-                                       torch.zeros(1))  # zero = unknown style
+                                       torch.zeros(PROFILE_FLAT_DIM))
 
         sample = {
             "X":          torch.from_numpy(X),
