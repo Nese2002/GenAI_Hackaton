@@ -60,13 +60,14 @@ class Config:
     lr: float = 5e-4                  # lowered from 1e-3 (NaN at step ~10k otherwise)
     weight_decay: float = 1e-4
     grad_clip: float = 0.5            # tighter to survive the GRU's occasional spikes
-    max_steps: int = 100_000
+    max_steps: int = 150_000
     log_every: int = 50
     val_every: int = 1000
     ckpt_every: int = 5000
     pos_weight: float = 10.0          # was 30 — too aggressive, caused logit blow-up
     drum_loss_weight: float = 1.0
     pitched_loss_weight: float = 1.0
+    style_loss_weight: float = 0.5    # style consistency auxiliary loss weight
     seed: int = 42
 
     # --- inference / post-processing -----------------------------------------

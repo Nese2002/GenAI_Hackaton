@@ -107,6 +107,7 @@ class RollDecoder(nn.Module):
 
         self.mem_proj = nn.Linear(memory_dim, d_model)
         self.pos_proj = nn.Linear(d_model, d_model)
+        self.style_proj = nn.Linear(style_dim, d_model)
         self.query_emb = nn.Parameter(torch.randn(time_steps, d_model) * 0.02)
 
         self.blocks = nn.ModuleList([
@@ -120,7 +121,8 @@ class RollDecoder(nn.Module):
         B = memory.shape[0]
         mem = self.mem_proj(memory)                    # (B, T_mem, d_model)
         pe = sinusoidal_positions(self.T, self.d_model, mem.device)  # (T, D)
-        q = self.query_emb.unsqueeze(0).expand(B, -1, -1) + self.pos_proj(pe).unsqueeze(0)
+        s_expand = self.style_proj(style).unsqueeze(1).expand(-1, self.T, -1)  # (B, T, d_model)
+        q = self.query_emb.unsqueeze(0).expand(B, -1, -1) + self.pos_proj(pe).unsqueeze(0) + s_expand
         for blk in self.blocks:
             q = blk(q, mem, style)
         q = self.norm(q)

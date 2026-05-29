@@ -245,7 +245,23 @@ def main() -> None:
             logits_p, logits_d = model(X, Z)
             loss_p = soft_bce_loss(logits_p, Yp, cfg.pos_weight)
             loss_d = soft_bce_loss(logits_d, Yd, cfg.pos_weight)
-            loss = cfg.pitched_loss_weight * loss_p + cfg.drum_loss_weight * loss_d
+
+            # Style consistency: re-encode the soft output and align it to Z's style.
+            pred_soft = torch.stack(
+                [torch.sigmoid(logits_p), torch.sigmoid(logits_d)], dim=1
+            )  # (B, 2, 128, 128)
+            with torch.no_grad():
+                style_z = model.style_encoder(Z)          # (B, style_dim) — target, no grad
+            style_out = model.style_encoder(pred_soft)    # (B, style_dim) — trained
+            loss_style = (
+                1.0 - F.cosine_similarity(style_out, style_z, dim=-1).mean()
+            )
+
+            loss = (
+                cfg.pitched_loss_weight * loss_p
+                + cfg.drum_loss_weight * loss_d
+                + cfg.style_loss_weight * loss_style
+            )
 
             # NaN guard: a single bad batch corrupts every parameter for the rest
             # of training. Drop it on the floor instead.
@@ -282,6 +298,7 @@ def main() -> None:
                 _LOGGER.info(
                     f"step {step:7d}  loss {loss.item():.4f}  "
                     f"p {loss_p.item():.4f}  d {loss_d.item():.4f}  "
+                    f"sty {loss_style.item():.4f}  "
                     f"gnorm {gnorm.item():.2f}  "
                     f"lr {optim.param_groups[0]['lr']:.2e}"
                 )
