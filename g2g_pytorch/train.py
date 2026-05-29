@@ -1,7 +1,7 @@
-"""Train the diffusion U-Net for piano-roll style transfer.
+"""Train the G2G profile-style-encoder model for piano-roll style transfer.
 
 Usage:
-    python -m g2g_pytorch.train --dataset-root ../dataset --logdir runs/exp5
+    python -m g2g_pytorch.train --dataset-root ../dataset --logdir runs/exp6
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 _HERE      = Path(__file__).resolve().parent
@@ -26,9 +27,10 @@ from .dataset import (
     HackathonRollDataset, carve_val_from_train, collate,
     load_all_profiles, read_manifest, split_triplets,
 )
-from .diffusion import DiffusionSchedule
-from .models.unet import UNet
-from .metrics import combined_roll_from_input, score_item_from_rolls, per_item_profile_from_Y
+from .models.g2g import G2GModel
+from .metrics import (
+    combined_roll_from_input, score_item_from_rolls, per_item_profile_from_Y,
+)
 
 _LOGGER = logging.getLogger("g2g_pytorch.train")
 
@@ -42,38 +44,45 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def load_style_profiles_np(root: str) -> Dict[str, Dict[str, np.ndarray]]:
+    """Load style profiles as numpy dicts for metric scoring."""
+    profiles_dir = Path(root) / "style_profiles"
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    if not profiles_dir.exists():
+        return out
+    for f in profiles_dir.iterdir():
+        if f.suffix != ".npz":
+            continue
+        with np.load(f) as z:
+            out[f.stem] = {k: z[k] for k in z.files}
+    return out
+
+
 def evaluate(
-    model: UNet,
-    schedule: DiffusionSchedule,
+    model: G2GModel,
     loader: DataLoader,
-    cfg: Config,
     device: torch.device,
-    style_profiles_np: Dict[str, Dict[str, np.ndarray]],
+    profiles_np: Dict[str, Dict[str, np.ndarray]],
     max_items: int = 50,
 ) -> Dict[str, float]:
-    """Run DDIM on a subset of val, score CP and SF."""
     model.eval()
     scores: List[Dict[str, float]] = []
     n = 0
 
     with torch.no_grad():
         for batch in loader:
-            X          = batch["X"].to(device)
-            style_flat = batch["style_flat"].to(device)
+            X           = batch["X"].to(device)
+            profile_flat = batch["style_flat"].to(device)
 
-            # Generate — returns (B, 2, 128, 128) in [0, 1]
-            gen = schedule.ddim_sample(
-                model, X, style_flat,
-                ddim_steps=cfg.ddim_steps,
-                cfg_scale=cfg.cfg_scale,
-            )
-            gen_np = gen.cpu().numpy()
-            X_np   = batch["X"].numpy()
-            Yp_np  = batch.get("Y_pitched")
-            Yd_np  = batch.get("Y_drum")
+            pitched, drum = model.predict_rolls(X, profile_flat)
+            pitched_np = pitched.cpu().numpy()
+            drum_np    = drum.cpu().numpy()
+            X_np  = batch["X"].numpy()
+            Yp_np = batch.get("Y_pitched")
+            Yd_np = batch.get("Y_drum")
 
             for i in range(len(batch["item_id"])):
-                prof = style_profiles_np.get(batch["style_tgt"][i])
+                prof = profiles_np.get(batch["style_tgt"][i])
                 if prof is None:
                     if Yp_np is None:
                         continue
@@ -81,7 +90,7 @@ def evaluate(
                         Yp_np[i].numpy(), Yd_np[i].numpy()
                     )
                 X_roll = combined_roll_from_input(X_np[i])
-                s = score_item_from_rolls(X_roll, gen_np[i, 0], gen_np[i, 1], prof)
+                s = score_item_from_rolls(X_roll, pitched_np[i], drum_np[i], prof)
                 scores.append(s)
                 n += 1
                 if n >= max_items:
@@ -98,20 +107,6 @@ def evaluate(
         "score": float(np.mean([s["score"] for s in scores])),
         "n":     len(scores),
     }
-
-
-def load_style_profiles_np(root: str) -> Dict[str, Dict[str, np.ndarray]]:
-    """Load style profiles as numpy dicts for metric scoring."""
-    profiles_dir = Path(root) / "style_profiles"
-    out: Dict[str, Dict[str, np.ndarray]] = {}
-    if not profiles_dir.exists():
-        return out
-    for f in profiles_dir.iterdir():
-        if f.suffix != ".npz":
-            continue
-        with np.load(f) as z:
-            out[f.stem] = {k: z[k] for k in z.files}
-    return out
 
 
 def main() -> None:
@@ -134,15 +129,11 @@ def main() -> None:
     if args.max_steps:     cfg.max_steps     = args.max_steps
     if args.num_workers is not None: cfg.num_workers = args.num_workers
     if args.debug:
-        cfg.batch_size         = 2
-        cfg.max_steps          = 50
-        cfg.log_every          = 5
-        cfg.val_every          = 25
-        cfg.ckpt_every         = 25
-        cfg.diffusion_steps    = 100
-        cfg.ddim_steps         = 5
-        cfg.unet_base_ch       = 16
-        cfg.unet_ch_mults      = (1, 2, 4, 8)
+        cfg.batch_size  = 2
+        cfg.max_steps   = 50
+        cfg.log_every   = 5
+        cfg.val_every   = 25
+        cfg.ckpt_every  = 25
 
     set_seed(cfg.seed)
     os.makedirs(cfg.logdir, exist_ok=True)
@@ -155,11 +146,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _LOGGER.info(f"Using device: {device}")
 
-    # Load style profiles (as tensors for dataset, as np dicts for scoring)
     _LOGGER.info("Loading style profiles...")
     profiles_tensor = load_all_profiles(cfg.dataset_root)
     profiles_np     = load_style_profiles_np(cfg.dataset_root)
-    _LOGGER.info(f"Loaded {len(profiles_tensor)} style profiles.")
+    _LOGGER.info(f"Loaded {len(profiles_tensor)} style profile tensors, "
+                 f"{len(profiles_np)} numpy dicts for scoring.")
 
     triplets = read_manifest(str(Path(cfg.dataset_root) / "manifest.csv"))
     splits   = split_triplets(triplets,
@@ -201,20 +192,9 @@ def main() -> None:
         num_workers=max(0, cfg.num_workers - 1), collate_fn=collate,
     )
 
-    # Build model and schedule
-    model = UNet(
-        in_channels=cfg.in_channels,
-        cond_channels=cfg.in_channels,
-        ch_mults=cfg.unet_ch_mults,
-        base_ch=cfg.unet_base_ch,
-        style_dim=cfg.unet_style_dim,
-        time_dim=cfg.unet_time_dim,
-        attn_resolutions=cfg.unet_attn_resolutions,
-    ).to(device)
+    model = G2GModel(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    _LOGGER.info(f"UNet parameters: {n_params:,}")
-
-    schedule = DiffusionSchedule(T=cfg.diffusion_steps, device=device)
+    _LOGGER.info(f"G2GModel parameters: {n_params:,}")
 
     optim = torch.optim.Adam(model.parameters(), lr=cfg.lr,
                              weight_decay=cfg.weight_decay)
@@ -238,19 +218,14 @@ def main() -> None:
             if step >= cfg.max_steps:
                 break
 
-            X          = batch["X"].to(device, non_blocking=True)
-            style_flat = batch["style_flat"].to(device, non_blocking=True)
-            Yp         = batch["Y_pitched"].to(device, non_blocking=True)
-            Yd         = batch["Y_drum"].to(device, non_blocking=True)
+            X            = batch["X"].to(device, non_blocking=True)
+            profile_flat = batch["style_flat"].to(device, non_blocking=True)
+            Yp           = batch["Y_pitched"].to(device, non_blocking=True)
+            Yd           = batch["Y_drum"].to(device, non_blocking=True)
 
-            # Normalise Y to [-1, 1] and stack into (B, 2, H, W)
-            Y = torch.stack([Yp, Yd], dim=1) * 2.0 - 1.0
-
-            loss = schedule.training_loss(
-                model, Y, X, style_flat,
-                cfg_content_p=cfg.cfg_content_p,
-                cfg_style_p=cfg.cfg_style_p,
-            )
+            p_logits, d_logits = model(X, profile_flat)
+            loss = (F.binary_cross_entropy_with_logits(p_logits, Yp)
+                    + F.binary_cross_entropy_with_logits(d_logits, Yd)) * 0.5
 
             if not torch.isfinite(loss):
                 skipped_nan += 1
@@ -282,7 +257,7 @@ def main() -> None:
                 )
 
             if step % cfg.val_every == 0 and len(val_ds) > 0:
-                m = evaluate(model, schedule, val_loader, cfg, device, profiles_np)
+                m = evaluate(model, val_loader, device, profiles_np)
                 _LOGGER.info(
                     f"VAL step {step}  n={m['n']}  CP={m['CP']:.3f}  "
                     f"SF={m['SF']:.3f}  HM={m['score']:.3f}"
@@ -291,7 +266,7 @@ def main() -> None:
             if step % cfg.ckpt_every == 0 or step == cfg.max_steps:
                 ckpt_dir = Path(cfg.logdir)
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
-                payload  = {
+                payload = {
                     "model": model.state_dict(),
                     "optim": optim.state_dict(),
                     "sched": sched.state_dict(),

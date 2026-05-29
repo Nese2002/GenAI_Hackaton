@@ -20,7 +20,18 @@ from torch.utils.data import Dataset
 from .utility.data import Triplet, read_manifest, load_roll_bundle, HackathonDataset
 from .utility.metric import build_style_profile_from_bundles
 from .utility.pianoroll import NUM_PITCHES, T_PER_FRAGMENT
-from .models.unet import flatten_profile, PROFILE_FLAT_DIM
+from .models.encoders import PROFILE_FLAT_DIM
+
+
+def flatten_profile(profile: dict) -> torch.Tensor:
+    """Concatenate the 4 histogram arrays into a single 1-D float32 tensor."""
+    parts = [
+        torch.as_tensor(profile["time_pitch"],     dtype=torch.float32).flatten(),
+        torch.as_tensor(profile["onset_duration"], dtype=torch.float32).flatten(),
+        torch.as_tensor(profile["onset_velocity"], dtype=torch.float32).flatten(),
+        torch.as_tensor(profile["onset_drum"],     dtype=torch.float32).flatten(),
+    ]
+    return torch.cat(parts, dim=0)
 
 
 # ---------------------------------------------------------------------------

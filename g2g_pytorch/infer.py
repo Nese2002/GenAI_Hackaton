@@ -1,9 +1,9 @@
-"""Run the trained diffusion model on the test split and write submission CSV.
+"""Run the trained G2G model on the test split and write submission CSV.
 
 Usage:
     python -m g2g_pytorch.infer \
         --dataset-root ../dataset \
-        --ckpt runs/exp5/model.pt \
+        --ckpt runs/exp6/model.pt \
         --output submission.csv
 """
 from __future__ import annotations
@@ -26,8 +26,7 @@ from .dataset import (
     HackathonRollDataset, collate,
     load_all_profiles, read_manifest, split_triplets,
 )
-from .diffusion import DiffusionSchedule
-from .models.unet import UNet
+from .models.g2g import G2GModel
 
 _LOGGER = logging.getLogger("g2g_pytorch.infer")
 
@@ -35,20 +34,12 @@ _LOGGER = logging.getLogger("g2g_pytorch.infer")
 def load_model(ckpt_path: str, device: torch.device) -> tuple:
     ck       = torch.load(ckpt_path, map_location=device)
     cfg_dict = ck.get("cfg", {})
-    cfg      = Config(**{k: v for k, v in cfg_dict.items() if k in Config().__dict__})
-    model    = UNet(
-        in_channels=cfg.in_channels,
-        cond_channels=cfg.in_channels,
-        ch_mults=cfg.unet_ch_mults,
-        base_ch=cfg.unet_base_ch,
-        style_dim=cfg.unet_style_dim,
-        time_dim=cfg.unet_time_dim,
-        attn_resolutions=cfg.unet_attn_resolutions,
-    ).to(device)
+    cfg      = Config(**{k: v for k, v in cfg_dict.items()
+                         if k in Config().__dict__})
+    model = G2GModel(cfg).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
-    schedule = DiffusionSchedule(T=cfg.diffusion_steps, device=device)
-    return model, schedule, cfg
+    return model, cfg
 
 
 def roll_to_notes_rows(item_id: str, pitched: np.ndarray, drum: np.ndarray,
@@ -71,8 +62,6 @@ def main() -> None:
     ap.add_argument("--batch-size",   type=int, default=8)
     ap.add_argument("--num-workers",  type=int, default=2)
     ap.add_argument("--threshold",    type=float, default=None)
-    ap.add_argument("--cfg-scale",    type=float, default=None)
-    ap.add_argument("--ddim-steps",   type=int,   default=None)
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -81,10 +70,8 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _LOGGER.info(f"Using device: {device}")
 
-    model, schedule, cfg = load_model(args.ckpt, device)
+    model, cfg = load_model(args.ckpt, device)
     cfg.dataset_root = args.dataset_root
-    if args.cfg_scale  is not None: cfg.cfg_scale  = args.cfg_scale
-    if args.ddim_steps is not None: cfg.ddim_steps = args.ddim_steps
     threshold = args.threshold if args.threshold is not None else cfg.velocity_threshold
 
     profiles = load_all_profiles(cfg.dataset_root)
@@ -111,22 +98,19 @@ def main() -> None:
     )
 
     all_rows: List[dict] = []
-    written_ids = set()
+    written_ids: set = set()
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
-            X          = batch["X"].to(device)
-            style_flat = batch["style_flat"].to(device)
+            X            = batch["X"].to(device)
+            profile_flat = batch["style_flat"].to(device)
 
-            gen = schedule.ddim_sample(
-                model, X, style_flat,
-                ddim_steps=cfg.ddim_steps,
-                cfg_scale=cfg.cfg_scale,
-            )  # (B, 2, 128, 128) in [0, 1]
-            gen_np = gen.cpu().numpy()
+            pitched, drum = model.predict_rolls(X, profile_flat)
+            pitched_np = pitched.cpu().numpy()
+            drum_np    = drum.cpu().numpy()
 
             for i, iid in enumerate(batch["item_id"]):
-                rows = roll_to_notes_rows(iid, gen_np[i, 0], gen_np[i, 1], threshold)
+                rows = roll_to_notes_rows(iid, pitched_np[i], drum_np[i], threshold)
                 all_rows.extend(rows)
                 written_ids.add(iid)
 

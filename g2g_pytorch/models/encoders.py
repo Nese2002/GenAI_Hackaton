@@ -17,6 +17,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utility.metric import (
+    TIME_BINS, PITCH_BINS, ONSET_BINS, DURATION_BINS, VELOCITY_BINS, DRUM_BINS,
+)
+
+# Flat dimension of a concatenated style profile histogram.
+PROFILE_FLAT_DIM: int = (
+    TIME_BINS * PITCH_BINS          # time_pitch:     32×128 = 4096
+    + ONSET_BINS * DURATION_BINS    # onset_duration: 16×16  =  256
+    + ONSET_BINS * VELOCITY_BINS    # onset_velocity: 16×8   =  128
+    + ONSET_BINS * DRUM_BINS        # onset_drum:     16×128 = 2048
+)                                   # total: 6528
+
 
 # ---------------------------------------------------------------------------
 # Vector Quantization bottleneck
@@ -230,4 +242,30 @@ class StyleEncoder(nn.Module):
         return s
 
 
-__all__ = ["ContentEncoder", "StyleEncoder"]
+# --------------------------------------------------------------------------
+# Profile style encoder: MLP on flattened histogram vector (B, 6528) → (B, style_dim)
+# --------------------------------------------------------------------------
+
+
+class ProfileStyleEncoder(nn.Module):
+    """Replace the Z-based CNN+GRU encoder with a direct MLP on profile histograms.
+
+    The profile is exactly what SF measures, so this directly aligns the
+    training representation with the evaluation metric.
+    """
+
+    def __init__(self, style_dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(PROFILE_FLAT_DIM, 1024), nn.SiLU(),
+            nn.Linear(1024, 512),              nn.SiLU(),
+            nn.Linear(512, style_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, profile_flat: torch.Tensor) -> torch.Tensor:
+        # profile_flat: (B, PROFILE_FLAT_DIM) — L1-normalised histograms
+        return self.dropout(self.net(profile_flat))
+
+
+__all__ = ["ContentEncoder", "StyleEncoder", "ProfileStyleEncoder", "PROFILE_FLAT_DIM"]

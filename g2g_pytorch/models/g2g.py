@@ -1,11 +1,11 @@
-"""End-to-end Groove2Groove-PT model: content encoder + style encoder + roll decoder."""
+"""End-to-end Groove2Groove-PT model: content encoder + profile style encoder + roll decoder."""
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
 from ..config import Config
-from .encoders import ContentEncoder, StyleEncoder
+from .encoders import ContentEncoder, ProfileStyleEncoder
 from .decoder import RollDecoder
 
 
@@ -21,20 +21,10 @@ class G2GModel(nn.Module):
             rnn_hidden=cfg.content_rnn_hidden,
             bidirectional=cfg.content_rnn_bidirectional,
         )
-        self.style_encoder = StyleEncoder(
-            in_channels=cfg.in_channels,
-            cnn2d_channels=cfg.style_cnn_channels,
-            cnn2d_kernels=cfg.style_cnn_kernels,
-            cnn2d_pools=cfg.style_cnn_pools,
-            cnn1d_channels=cfg.style_1d_channels,
-            cnn1d_kernels=cfg.style_1d_kernels,
-            cnn1d_pools=cfg.style_1d_pools,
-            rnn_hidden=cfg.style_rnn_hidden,
+        self.style_encoder = ProfileStyleEncoder(
             style_dim=cfg.style_dim,
             dropout=cfg.style_dropout,
         )
-        # We pass a placeholder memory_dim that we'll resolve lazily by running
-        # one dummy forward. Easier: pre-compute by knowing content_rnn output.
         memory_dim = cfg.content_rnn_hidden * (2 if cfg.content_rnn_bidirectional else 1)
         self.decoder = RollDecoder(
             memory_dim=memory_dim,
@@ -47,15 +37,15 @@ class G2GModel(nn.Module):
             dropout=cfg.decoder_dropout,
         )
 
-    def forward(self, X: torch.Tensor, Z: torch.Tensor) -> tuple:
-        memory = self.content_encoder(X)               # (B, T_mem, H)
-        style  = self.style_encoder(Z)                 # (B, style_dim)
-        return self.decoder(memory, style)             # (logits_pitched, logits_drum)
+    def forward(self, X: torch.Tensor, profile_flat: torch.Tensor) -> tuple:
+        memory = self.content_encoder(X)           # (B, T_mem, H)
+        style  = self.style_encoder(profile_flat)  # (B, style_dim)
+        return self.decoder(memory, style)         # (logits_pitched, logits_drum)
 
     @torch.no_grad()
-    def predict_rolls(self, X: torch.Tensor, Z: torch.Tensor) -> tuple:
+    def predict_rolls(self, X: torch.Tensor, profile_flat: torch.Tensor) -> tuple:
         """Return (pitched_roll, drum_roll) with values in [0, 1]."""
-        p, d = self.forward(X, Z)
+        p, d = self.forward(X, profile_flat)
         return torch.sigmoid(p), torch.sigmoid(d)
 
 
