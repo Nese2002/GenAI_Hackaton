@@ -72,7 +72,7 @@ def evaluate(model: G2GModel, loader: DataLoader, cfg: Config, device: torch.dev
         for batch in loader:
             X = batch["X"].to(device)
             Z = batch["Z"].to(device)
-            lp, ld, _ = model(X, Z)
+            lp, ld = model(X, Z)
             p, d = torch_logits_to_rolls(lp, ld, cfg.velocity_threshold)
             X_np = batch["X"].numpy()
             Yp_np = batch["Y_pitched"].numpy() if "Y_pitched" in batch else None
@@ -242,12 +242,27 @@ def main() -> None:
             Yp = batch["Y_pitched"].to(device, non_blocking=True)
             Yd = batch["Y_drum"].to(device, non_blocking=True)
 
-            logits_p, logits_d, vq_loss = model(X, Z)
+            logits_p, logits_d = model(X, Z)
             loss_p = soft_bce_loss(logits_p, Yp, cfg.pos_weight)
             loss_d = soft_bce_loss(logits_d, Yd, cfg.pos_weight)
+
+            # Histogram loss: soft SF metric directly on the output.
+            pred_p = torch.sigmoid(logits_p)   # (B, 128, 128)
+            pred_d = torch.sigmoid(logits_d)   # (B, 128, 128)
+            # Pitch density — average velocity per pitch over time
+            loss_h_pitch = 1 - F.cosine_similarity(
+                pred_p.mean(dim=-1), Yp.mean(dim=-1).detach(), dim=-1).mean()
+            # Onset activity — average pitched activity per time step
+            loss_h_onset = 1 - F.cosine_similarity(
+                pred_p.mean(dim=1), Yp.mean(dim=1).detach(), dim=-1).mean()
+            # Drum rhythm — average drum activity per time step
+            loss_h_drum = 1 - F.cosine_similarity(
+                pred_d.mean(dim=1), Yd.mean(dim=1).detach(), dim=-1).mean()
+            loss_hist = (loss_h_pitch + loss_h_onset + loss_h_drum) / 3
+
             loss = (cfg.pitched_loss_weight * loss_p
                     + cfg.drum_loss_weight   * loss_d
-                    + cfg.vq_loss_weight     * vq_loss)
+                    + cfg.hist_loss_weight   * loss_hist)
 
             # NaN guard: a single bad batch corrupts every parameter for the rest
             # of training. Drop it on the floor instead.
@@ -284,7 +299,7 @@ def main() -> None:
                 _LOGGER.info(
                     f"step {step:7d}  loss {loss.item():.4f}  "
                     f"p {loss_p.item():.4f}  d {loss_d.item():.4f}  "
-                    f"vq {vq_loss.item():.4f}  "
+                    f"hist {loss_hist.item():.4f}  "
                     f"gnorm {gnorm.item():.2f}  "
                     f"lr {optim.param_groups[0]['lr']:.2e}"
                 )

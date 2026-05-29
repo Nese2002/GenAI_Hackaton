@@ -37,7 +37,7 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple:
     model = G2GModel(cfg).to(device)
     with torch.no_grad():
         dummy = torch.zeros(1, cfg.in_channels, cfg.num_pitches, cfg.num_time_steps, device=device)
-        model(dummy, dummy)  # lazy-builds GRU and VQ codebook
+        model(dummy, dummy)
     model.load_state_dict(ck["model"])
     model.eval()
     return model, cfg
@@ -112,7 +112,7 @@ def main() -> None:
         for batch in loader:
             X = batch["X"].to(device)
             Z = batch["Z"].to(device)
-            lp, ld, _ = model(X, Z)
+            lp, ld = model(X, Z)
             p = torch.sigmoid(lp).cpu().numpy().astype(np.float32)
             d = torch.sigmoid(ld).cpu().numpy().astype(np.float32)
             p[p < threshold] = 0.0

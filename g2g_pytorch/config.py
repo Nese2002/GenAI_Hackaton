@@ -31,11 +31,6 @@ class Config:
     out_pitched_channels: int = 1
     out_drum_channels: int = 1
 
-    # --- VQ bottleneck on content encoder ------------------------------------
-    vq_num_codes:       int   = 512    # codebook size; 0 = disabled
-    vq_commitment_cost: float = 0.25   # beta in VQ-VAE paper
-    vq_loss_weight:     float = 1.0    # weight of VQ loss in total loss
-
     # --- content encoder ------------------------------------------------------
     content_cnn_channels: tuple = (32, 32)
     content_cnn_kernels: tuple = ((12, 12), (4, 4))
@@ -73,6 +68,7 @@ class Config:
     drum_loss_weight: float = 1.0
     pitched_loss_weight: float = 1.0
     style_loss_weight: float = 0.0    # disabled — caused style encoder collapse
+    hist_loss_weight:  float = 0.3    # differentiable histogram loss weight
     seed: int = 42
 
     # --- inference / post-processing -----------------------------------------

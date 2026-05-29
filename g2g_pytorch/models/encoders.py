@@ -137,8 +137,6 @@ class ContentEncoder(nn.Module):
         cnn_pools: Sequence[Tuple[int, int]],
         rnn_hidden: int,
         bidirectional: bool = True,
-        vq_num_codes: int = 0,
-        vq_commitment_cost: float = 0.25,
     ) -> None:
         super().__init__()
         self.cnn = Conv2dStack(in_channels, cnn_channels, cnn_kernels, cnn_pools)
@@ -146,13 +144,6 @@ class ContentEncoder(nn.Module):
         self._bidir      = bidirectional
         self.rnn: nn.Module = nn.Identity()
         self._built = False
-        # VQ bottleneck — built eagerly since we know output_dim.
-        code_dim = rnn_hidden * (2 if bidirectional else 1)
-        self.vq: nn.Module = (
-            VectorQuantizer(vq_num_codes, code_dim, vq_commitment_cost)
-            if vq_num_codes > 0 else nn.Identity()
-        )
-        self._use_vq = vq_num_codes > 0
 
     def _build_rnn(self, gru_in_size: int, device: torch.device) -> None:
         self.rnn = nn.GRU(
@@ -168,8 +159,7 @@ class ContentEncoder(nn.Module):
     def output_dim(self) -> int:
         return self._rnn_hidden * (2 if self._bidir else 1)
 
-    def forward(self, x: torch.Tensor) -> tuple:
-        """Returns (memory, vq_loss). vq_loss is 0 when VQ is disabled."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         f = self.cnn(x)                                # (B, C', P', T')
         B, C, P, T = f.shape
         f = f.permute(0, 3, 1, 2).contiguous()         # (B, T', C', P')
@@ -177,11 +167,7 @@ class ContentEncoder(nn.Module):
         if not self._built:
             self._build_rnn(f.shape[-1], f.device)
         memory, _ = self.rnn(f)                        # (B, T', H)
-        if self._use_vq:
-            memory, vq_loss = self.vq(memory)
-        else:
-            vq_loss = memory.new_zeros(1).squeeze()
-        return memory, vq_loss
+        return memory
 
 
 # --------------------------------------------------------------------------
