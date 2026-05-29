@@ -15,7 +15,6 @@ over tracks, and only ``is_drum`` matters in the histograms).
 from __future__ import annotations
 
 import random
-import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -23,18 +22,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# Make sibling ``utility`` importable.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from hackaton.g2g_pytorch.utility.data import (
-    Triplet,
-    read_manifest,
-    load_roll_bundle,
-    HackathonDataset,
-)
-from hackaton.g2g_pytorch.utility.pianoroll import NUM_PITCHES, T_PER_FRAGMENT
+from .utility.data import Triplet, read_manifest, load_roll_bundle, HackathonDataset
+from .utility.pianoroll import NUM_PITCHES, T_PER_FRAGMENT
 
 
 # --------------------------------------------------------------------------
