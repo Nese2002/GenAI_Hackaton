@@ -1,4 +1,9 @@
-"""Train the G2G profile-style-encoder model for piano-roll style transfer.
+"""Train the G2G profile-style model for piano-roll style transfer.
+
+Loss:
+    BCE(output, Y)
+    + lambda_cp * soft_chroma_cp_loss(output, X)   -- CP surrogate
+    + lambda_sf * soft_sf_loss(output, profile)    -- SF surrogate
 
 Usage:
     python -m g2g_pytorch.train --dataset-root ../dataset --logdir runs/exp6
@@ -27,6 +32,7 @@ from .dataset import (
     HackathonRollDataset, carve_val_from_train, collate,
     load_all_profiles, read_manifest, split_triplets,
 )
+from .losses import soft_chroma_cp_loss, soft_sf_loss
 from .models.g2g import G2GModel
 from .metrics import (
     combined_roll_from_input, score_item_from_rolls, per_item_profile_from_Y,
@@ -45,7 +51,7 @@ def set_seed(seed: int) -> None:
 
 
 def load_style_profiles_np(root: str) -> Dict[str, Dict[str, np.ndarray]]:
-    """Load style profiles as numpy dicts for metric scoring."""
+    """Load style profiles as numpy dicts for metric scoring at val time."""
     profiles_dir = Path(root) / "style_profiles"
     out: Dict[str, Dict[str, np.ndarray]] = {}
     if not profiles_dir.exists():
@@ -71,7 +77,7 @@ def evaluate(
 
     with torch.no_grad():
         for batch in loader:
-            X           = batch["X"].to(device)
+            X            = batch["X"].to(device)
             profile_flat = batch["style_flat"].to(device)
 
             pitched, drum = model.predict_rolls(X, profile_flat)
@@ -111,29 +117,35 @@ def evaluate(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset-root", type=str, default=None)
-    ap.add_argument("--logdir",       type=str, default=None)
-    ap.add_argument("--batch-size",   type=int, default=None)
-    ap.add_argument("--lr",           type=float, default=None)
-    ap.add_argument("--max-steps",    type=int, default=None)
-    ap.add_argument("--num-workers",  type=int, default=None)
-    ap.add_argument("--resume",       type=str, default=None)
-    ap.add_argument("--debug",        action="store_true")
+    ap.add_argument("--dataset-root",   type=str,   default=None)
+    ap.add_argument("--logdir",         type=str,   default=None)
+    ap.add_argument("--batch-size",     type=int,   default=None)
+    ap.add_argument("--lr",             type=float, default=None)
+    ap.add_argument("--max-steps",      type=int,   default=None)
+    ap.add_argument("--num-workers",    type=int,   default=None)
+    ap.add_argument("--lambda-cp",      type=float, default=None,
+                    help="Weight for soft chroma-CP auxiliary loss.")
+    ap.add_argument("--lambda-sf",      type=float, default=None,
+                    help="Weight for soft histogram-SF auxiliary loss.")
+    ap.add_argument("--resume",         type=str,   default=None)
+    ap.add_argument("--debug",          action="store_true")
     args = ap.parse_args()
 
     cfg = Config()
-    if args.dataset_root:  cfg.dataset_root = args.dataset_root
-    if args.logdir:        cfg.logdir        = args.logdir
-    if args.batch_size:    cfg.batch_size    = args.batch_size
-    if args.lr:            cfg.lr            = args.lr
-    if args.max_steps:     cfg.max_steps     = args.max_steps
+    if args.dataset_root: cfg.dataset_root = args.dataset_root
+    if args.logdir:       cfg.logdir        = args.logdir
+    if args.batch_size:   cfg.batch_size    = args.batch_size
+    if args.lr:           cfg.lr            = args.lr
+    if args.max_steps:    cfg.max_steps     = args.max_steps
     if args.num_workers is not None: cfg.num_workers = args.num_workers
+    if args.lambda_cp is not None:   cfg.loss_lambda_cp = args.lambda_cp
+    if args.lambda_sf is not None:   cfg.loss_lambda_sf = args.lambda_sf
     if args.debug:
-        cfg.batch_size  = 2
-        cfg.max_steps   = 50
-        cfg.log_every   = 5
-        cfg.val_every   = 25
-        cfg.ckpt_every  = 25
+        cfg.batch_size = 2
+        cfg.max_steps  = 50
+        cfg.log_every  = 5
+        cfg.val_every  = 25
+        cfg.ckpt_every = 25
 
     set_seed(cfg.seed)
     os.makedirs(cfg.logdir, exist_ok=True)
@@ -145,12 +157,13 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _LOGGER.info(f"Using device: {device}")
+    _LOGGER.info(f"lambda_cp={cfg.loss_lambda_cp}  lambda_sf={cfg.loss_lambda_sf}")
 
     _LOGGER.info("Loading style profiles...")
     profiles_tensor = load_all_profiles(cfg.dataset_root)
     profiles_np     = load_style_profiles_np(cfg.dataset_root)
-    _LOGGER.info(f"Loaded {len(profiles_tensor)} style profile tensors, "
-                 f"{len(profiles_np)} numpy dicts for scoring.")
+    _LOGGER.info(f"Loaded {len(profiles_tensor)} profile tensors, "
+                 f"{len(profiles_np)} numpy dicts for val scoring.")
 
     triplets = read_manifest(str(Path(cfg.dataset_root) / "manifest.csv"))
     splits   = split_triplets(triplets,
@@ -224,8 +237,18 @@ def main() -> None:
             Yd           = batch["Y_drum"].to(device, non_blocking=True)
 
             p_logits, d_logits = model(X, profile_flat)
-            loss = (F.binary_cross_entropy_with_logits(p_logits, Yp)
-                    + F.binary_cross_entropy_with_logits(d_logits, Yd)) * 0.5
+
+            bce_loss = (F.binary_cross_entropy_with_logits(p_logits, Yp)
+                       + F.binary_cross_entropy_with_logits(d_logits, Yd)) * 0.5
+
+            p_probs  = torch.sigmoid(p_logits)
+            d_probs  = torch.sigmoid(d_logits)
+            cp_loss  = soft_chroma_cp_loss(p_probs, X[:, 0])
+            sf_loss  = soft_sf_loss(p_probs, d_probs, profile_flat)
+
+            loss = (bce_loss
+                    + cfg.loss_lambda_cp * cp_loss
+                    + cfg.loss_lambda_sf * sf_loss)
 
             if not torch.isfinite(loss):
                 skipped_nan += 1
@@ -251,7 +274,9 @@ def main() -> None:
 
             if step % cfg.log_every == 0:
                 _LOGGER.info(
-                    f"step {step:7d}  loss {loss.item():.4f}  "
+                    f"step {step:7d}  total {loss.item():.4f}  "
+                    f"bce {bce_loss.item():.4f}  "
+                    f"cp {cp_loss.item():.4f}  sf {sf_loss.item():.4f}  "
                     f"gnorm {gnorm.item():.2f}  "
                     f"lr {optim.param_groups[0]['lr']:.2e}"
                 )

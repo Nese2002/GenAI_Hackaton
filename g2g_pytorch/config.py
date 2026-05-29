@@ -1,7 +1,7 @@
-"""Hyperparameters for the Groove2Groove profile-style-encoder model (exp6)."""
+"""Hyperparameters for the Groove2Groove profile-style model (exp6)."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 
@@ -23,20 +23,22 @@ class Config:
 
     # --- content encoder ------------------------------------------------------
     content_cnn_channels: Tuple[int, ...] = (32, 64)
-    content_cnn_kernels:  Tuple = ((3, 3), (3, 3))
-    content_cnn_pools:    Tuple = ((2, 1), (2, 1))
-    content_rnn_hidden:   int   = 200
-    content_rnn_bidirectional: bool = True
-
-    # --- style encoder (profile MLP) -----------------------------------------
-    style_dim:     int   = 256
-    style_dropout: float = 0.1
+    content_cnn_kernels:  Tuple           = ((3, 3), (3, 3))
+    content_cnn_pools:    Tuple           = ((2, 1), (2, 1))
+    content_rnn_hidden:   int             = 200
+    content_rnn_bidirectional: bool       = True
 
     # --- decoder --------------------------------------------------------------
+    # style_dim is NOT listed here — the decoder conditions directly on the
+    # raw 6528-d profile (PROFILE_FLAT_DIM), bypassing any learned bottleneck.
     decoder_hidden:     int   = 256
     decoder_attn_heads: int   = 4
     decoder_layers:     int   = 4
     decoder_dropout:    float = 0.1
+
+    # --- loss weights ---------------------------------------------------------
+    loss_lambda_cp: float = 0.5   # weight for soft chroma-CP auxiliary loss
+    loss_lambda_sf: float = 0.5   # weight for soft histogram-SF auxiliary loss
 
     # --- training -------------------------------------------------------------
     batch_size:   int   = 16
