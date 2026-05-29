@@ -1,10 +1,9 @@
-"""Run a trained model on the test split and write a Kaggle-format CSV.
+"""Run the trained diffusion model on the test split and write submission CSV.
 
 Usage:
-    cd code
     python -m g2g_pytorch.infer \
         --dataset-root ../dataset \
-        --ckpt runs/exp1/model.pt \
+        --ckpt runs/exp5/model.pt \
         --output submission.csv
 """
 from __future__ import annotations
@@ -12,7 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import torch
@@ -23,53 +22,57 @@ from .utility import pianoroll as _pr
 from .utility.pianoroll import VELOCITY_THRESHOLD
 
 from .config import Config
-from .dataset import HackathonRollDataset, collate, read_manifest, split_triplets
-from .models import G2GModel
-
+from .dataset import (
+    HackathonRollDataset, collate,
+    load_all_profiles, read_manifest, split_triplets,
+)
+from .diffusion import DiffusionSchedule
+from .models.unet import UNet
 
 _LOGGER = logging.getLogger("g2g_pytorch.infer")
 
 
 def load_model(ckpt_path: str, device: torch.device) -> tuple:
-    ck = torch.load(ckpt_path, map_location=device)
+    ck       = torch.load(ckpt_path, map_location=device)
     cfg_dict = ck.get("cfg", {})
-    cfg = Config(**{k: v for k, v in cfg_dict.items() if k in Config().__dict__})
-    model = G2GModel(cfg).to(device)
-    with torch.no_grad():
-        dummy = torch.zeros(1, cfg.in_channels, cfg.num_pitches, cfg.num_time_steps, device=device)
-        model(dummy, dummy)
+    cfg      = Config(**{k: v for k, v in cfg_dict.items() if k in Config().__dict__})
+    model    = UNet(
+        in_channels=cfg.in_channels,
+        cond_channels=cfg.in_channels,
+        ch_mults=cfg.unet_ch_mults,
+        base_ch=cfg.unet_base_ch,
+        style_dim=cfg.unet_style_dim,
+        time_dim=cfg.unet_time_dim,
+        attn_resolutions=cfg.unet_attn_resolutions,
+    ).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
-    return model, cfg
+    schedule = DiffusionSchedule(T=cfg.diffusion_steps, device=device)
+    return model, schedule, cfg
 
 
 def roll_to_notes_rows(item_id: str, pitched: np.ndarray, drum: np.ndarray,
                        threshold: float) -> List[dict]:
-    """Convert one item's (P, T) predicted rolls into per-note dicts."""
     notes: List[_pr.Note] = []
     notes.extend(_pr.roll_to_notes(pitched, threshold=threshold, is_drum=False, track_id=0))
-    notes.extend(_pr.roll_to_notes(drum, threshold=threshold, is_drum=True, track_id=999))
+    notes.extend(_pr.roll_to_notes(drum,    threshold=threshold, is_drum=True,  track_id=999))
     if not notes:
-        # Submission requires at least one row per item; emit a quiet placeholder
-        # so the row exists. The metric will score it poorly but the CSV is accepted.
-        notes.append(
-            _pr.Note(pitch=60, onset_beats=0.0, duration_beats=0.25, velocity=1,
-                     is_drum=False, track_id=0)
-        )
+        notes.append(_pr.Note(pitch=60, onset_beats=0.0, duration_beats=0.25,
+                              velocity=1, is_drum=False, track_id=0))
     return list(_sub.notes_to_rows(item_id, notes))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-root", type=str, required=True)
-    ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--output", type=str, default="submission.csv")
-    ap.add_argument("--split", type=str, default="test",
-                    help="Which manifest split to predict (default: test)")
-    ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--num-workers", type=int, default=2)
-    ap.add_argument("--threshold", type=float, default=None,
-                    help="Override velocity threshold for note extraction.")
+    ap.add_argument("--ckpt",         type=str, required=True)
+    ap.add_argument("--output",       type=str, default="submission.csv")
+    ap.add_argument("--split",        type=str, default="test")
+    ap.add_argument("--batch-size",   type=int, default=8)
+    ap.add_argument("--num-workers",  type=int, default=2)
+    ap.add_argument("--threshold",    type=float, default=None)
+    ap.add_argument("--cfg-scale",    type=float, default=None)
+    ap.add_argument("--ddim-steps",   type=int,   default=None)
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -78,11 +81,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _LOGGER.info(f"Using device: {device}")
 
-    model, cfg = load_model(args.ckpt, device)
+    model, schedule, cfg = load_model(args.ckpt, device)
     cfg.dataset_root = args.dataset_root
+    if args.cfg_scale  is not None: cfg.cfg_scale  = args.cfg_scale
+    if args.ddim_steps is not None: cfg.ddim_steps = args.ddim_steps
     threshold = args.threshold if args.threshold is not None else cfg.velocity_threshold
 
-    triplets = read_manifest(str(Path(cfg.dataset_root) / "manifest.csv"))
+    profiles = load_all_profiles(cfg.dataset_root)
+    _LOGGER.info(f"Loaded {len(profiles)} style profiles.")
+
+    triplets  = read_manifest(str(Path(cfg.dataset_root) / "manifest.csv"))
     split_map = split_triplets(triplets,
                                train_split=cfg.train_split,
                                val_split=cfg.val_split,
@@ -92,13 +100,9 @@ def main() -> None:
         raise RuntimeError(f"No items in split '{args.split}'")
 
     ds = HackathonRollDataset(
-        cfg.dataset_root, use, cfg.num_pitches, cfg.num_time_steps, require_Y=False
+        cfg.dataset_root, use, cfg.num_pitches, cfg.num_time_steps,
+        require_Y=False, profiles=profiles,
     )
-    if len(ds) == 0:
-        raise RuntimeError(
-            f"No NPZ files on disk for split '{args.split}'. "
-            f"Re-download the dataset and try again."
-        )
     _LOGGER.info(f"Predicting on {len(ds)} items ({ds._skipped} skipped).")
 
     loader = DataLoader(
@@ -108,21 +112,27 @@ def main() -> None:
 
     all_rows: List[dict] = []
     written_ids = set()
+
     with torch.no_grad():
-        for batch in loader:
-            X = batch["X"].to(device)
-            Z = batch["Z"].to(device)
-            lp, ld = model(X, Z)
-            p = torch.sigmoid(lp).cpu().numpy().astype(np.float32)
-            d = torch.sigmoid(ld).cpu().numpy().astype(np.float32)
-            p[p < threshold] = 0.0
-            d[d < threshold] = 0.0
+        for batch_idx, batch in enumerate(loader):
+            X          = batch["X"].to(device)
+            style_flat = batch["style_flat"].to(device)
+
+            gen = schedule.ddim_sample(
+                model, X, style_flat,
+                ddim_steps=cfg.ddim_steps,
+                cfg_scale=cfg.cfg_scale,
+            )  # (B, 2, 128, 128) in [0, 1]
+            gen_np = gen.cpu().numpy()
+
             for i, iid in enumerate(batch["item_id"]):
-                rows = roll_to_notes_rows(iid, p[i], d[i], threshold=threshold)
+                rows = roll_to_notes_rows(iid, gen_np[i, 0], gen_np[i, 1], threshold)
                 all_rows.extend(rows)
                 written_ids.add(iid)
 
-    # Every requested item must appear in the CSV, even if the model produced nothing.
+            if (batch_idx + 1) % 10 == 0:
+                _LOGGER.info(f"  processed {len(written_ids)}/{len(ds)} items")
+
     expected_ids = [t.item_id for t in use]
     for iid in expected_ids:
         if iid not in written_ids:
@@ -134,7 +144,7 @@ def main() -> None:
     out_path = _sub.write_submission(args.output, all_rows)
     _LOGGER.info(f"Wrote submission to {out_path}")
     df = _sub.validate_submission(out_path, required_item_ids=expected_ids)
-    _LOGGER.info(f"Validated submission: {len(df)} note rows across "
+    _LOGGER.info(f"Validated: {len(df)} note rows across "
                  f"{df['item_id'].nunique() if len(df) else 0} items.")
 
 
