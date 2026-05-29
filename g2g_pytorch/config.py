@@ -67,7 +67,7 @@ class Config:
     pos_weight: float = 10.0          # was 30 — too aggressive, caused logit blow-up
     drum_loss_weight: float = 1.0
     pitched_loss_weight: float = 1.0
-    style_loss_weight: float = 0.5    # style consistency auxiliary loss weight
+    style_loss_weight: float = 0.0    # disabled — caused style encoder collapse
     seed: int = 42
 
     # --- inference / post-processing -----------------------------------------
