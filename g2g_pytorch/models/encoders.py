@@ -18,6 +18,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Vector Quantization bottleneck
+# ---------------------------------------------------------------------------
+
+class VectorQuantizer(nn.Module):
+    """Straight-through VQ bottleneck (VQ-VAE, van den Oord et al. 2017).
+
+    Replaces each continuous encoder vector with the nearest codebook entry.
+    Gradient flows back through the straight-through estimator.
+
+    Loss returned = codebook_loss + commitment_cost * commitment_loss.
+    """
+
+    def __init__(self, num_codes: int, code_dim: int,
+                 commitment_cost: float = 0.25) -> None:
+        super().__init__()
+        self.num_codes      = num_codes
+        self.code_dim       = code_dim
+        self.commitment_cost = commitment_cost
+        self.codebook = nn.Embedding(num_codes, code_dim)
+        nn.init.uniform_(self.codebook.weight,
+                         -1.0 / num_codes, 1.0 / num_codes)
+
+    def forward(self, z_e: torch.Tensor) -> tuple:
+        """
+        Args:
+            z_e: (B, T, D) continuous encoder output.
+        Returns:
+            z_q: (B, T, D) quantized output (straight-through in backward).
+            loss: scalar — codebook + commitment loss.
+        """
+        B, T, D = z_e.shape
+        flat = z_e.reshape(-1, D)                        # (B*T, D)
+
+        # Squared distances to each codebook entry.
+        dists = (
+            flat.pow(2).sum(1, keepdim=True)
+            + self.codebook.weight.pow(2).sum(1)
+            - 2.0 * flat @ self.codebook.weight.t()
+        )                                                 # (B*T, K)
+
+        indices = dists.argmin(dim=1)                    # (B*T,)
+        z_q_flat = self.codebook(indices)                # (B*T, D)
+        z_q = z_q_flat.reshape(B, T, D)
+
+        # Codebook loss: moves codes toward encoder outputs.
+        # Commitment loss: moves encoder outputs toward codes.
+        loss = (F.mse_loss(z_q, z_e.detach())
+                + self.commitment_cost * F.mse_loss(z_e, z_q.detach()))
+
+        # Straight-through: copy gradient of z_q to z_e.
+        z_q = z_e + (z_q - z_e).detach()
+        return z_q, loss
+
+
 class Conv2dStack(nn.Module):
     """Sequential Conv2d + ELU + MaxPool2d blocks."""
 
@@ -82,17 +137,22 @@ class ContentEncoder(nn.Module):
         cnn_pools: Sequence[Tuple[int, int]],
         rnn_hidden: int,
         bidirectional: bool = True,
+        vq_num_codes: int = 0,
+        vq_commitment_cost: float = 0.25,
     ) -> None:
         super().__init__()
         self.cnn = Conv2dStack(in_channels, cnn_channels, cnn_kernels, cnn_pools)
-        # After conv stack on (B, C, 128, 128) we'll have (B, c_out, P', T').
-        # We'll lazily build the GRU input size on first forward by computing
-        # P' * c_out. We capture it here with a dummy if you want, but it's
-        # simpler to construct the GRU on first call.
         self._rnn_hidden = rnn_hidden
-        self._bidir = bidirectional
+        self._bidir      = bidirectional
         self.rnn: nn.Module = nn.Identity()
         self._built = False
+        # VQ bottleneck — built eagerly since we know output_dim.
+        code_dim = rnn_hidden * (2 if bidirectional else 1)
+        self.vq: nn.Module = (
+            VectorQuantizer(vq_num_codes, code_dim, vq_commitment_cost)
+            if vq_num_codes > 0 else nn.Identity()
+        )
+        self._use_vq = vq_num_codes > 0
 
     def _build_rnn(self, gru_in_size: int, device: torch.device) -> None:
         self.rnn = nn.GRU(
@@ -108,8 +168,8 @@ class ContentEncoder(nn.Module):
     def output_dim(self) -> int:
         return self._rnn_hidden * (2 if self._bidir else 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, P, T) with P=T=128
+    def forward(self, x: torch.Tensor) -> tuple:
+        """Returns (memory, vq_loss). vq_loss is 0 when VQ is disabled."""
         f = self.cnn(x)                                # (B, C', P', T')
         B, C, P, T = f.shape
         f = f.permute(0, 3, 1, 2).contiguous()         # (B, T', C', P')
@@ -117,7 +177,11 @@ class ContentEncoder(nn.Module):
         if not self._built:
             self._build_rnn(f.shape[-1], f.device)
         memory, _ = self.rnn(f)                        # (B, T', H)
-        return memory
+        if self._use_vq:
+            memory, vq_loss = self.vq(memory)
+        else:
+            vq_loss = memory.new_zeros(1).squeeze()
+        return memory, vq_loss
 
 
 # --------------------------------------------------------------------------

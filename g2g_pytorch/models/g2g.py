@@ -20,6 +20,8 @@ class G2GModel(nn.Module):
             cnn_pools=cfg.content_cnn_pools,
             rnn_hidden=cfg.content_rnn_hidden,
             bidirectional=cfg.content_rnn_bidirectional,
+            vq_num_codes=cfg.vq_num_codes,
+            vq_commitment_cost=cfg.vq_commitment_cost,
         )
         self.style_encoder = StyleEncoder(
             in_channels=cfg.in_channels,
@@ -48,14 +50,18 @@ class G2GModel(nn.Module):
         )
 
     def forward(self, X: torch.Tensor, Z: torch.Tensor) -> tuple:
-        memory = self.content_encoder(X)               # (B, T_mem, H)
+        """Returns (logits_pitched, logits_drum, vq_loss).
+        vq_loss is 0 when VQ is disabled (vq_num_codes=0).
+        """
+        memory, vq_loss = self.content_encoder(X)      # (B, T_mem, H), scalar
         style = self.style_encoder(Z)                  # (B, style_dim)
-        return self.decoder(memory, style)             # (logits_pitched, logits_drum)
+        logits_p, logits_d = self.decoder(memory, style)
+        return logits_p, logits_d, vq_loss
 
     @torch.no_grad()
     def predict_rolls(self, X: torch.Tensor, Z: torch.Tensor) -> tuple:
         """Return (pitched_roll, drum_roll) with values in [0, 1]."""
-        p, d = self.forward(X, Z)
+        p, d, _ = self.forward(X, Z)
         return torch.sigmoid(p), torch.sigmoid(d)
 
 

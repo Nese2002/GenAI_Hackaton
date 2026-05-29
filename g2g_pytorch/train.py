@@ -72,7 +72,7 @@ def evaluate(model: G2GModel, loader: DataLoader, cfg: Config, device: torch.dev
         for batch in loader:
             X = batch["X"].to(device)
             Z = batch["Z"].to(device)
-            lp, ld = model(X, Z)
+            lp, ld, _ = model(X, Z)
             p, d = torch_logits_to_rolls(lp, ld, cfg.velocity_threshold)
             X_np = batch["X"].numpy()
             Yp_np = batch["Y_pitched"].numpy() if "Y_pitched" in batch else None
@@ -242,10 +242,12 @@ def main() -> None:
             Yp = batch["Y_pitched"].to(device, non_blocking=True)
             Yd = batch["Y_drum"].to(device, non_blocking=True)
 
-            logits_p, logits_d = model(X, Z)
+            logits_p, logits_d, vq_loss = model(X, Z)
             loss_p = soft_bce_loss(logits_p, Yp, cfg.pos_weight)
             loss_d = soft_bce_loss(logits_d, Yd, cfg.pos_weight)
-            loss = cfg.pitched_loss_weight * loss_p + cfg.drum_loss_weight * loss_d
+            loss = (cfg.pitched_loss_weight * loss_p
+                    + cfg.drum_loss_weight   * loss_d
+                    + cfg.vq_loss_weight     * vq_loss)
 
             # NaN guard: a single bad batch corrupts every parameter for the rest
             # of training. Drop it on the floor instead.
@@ -282,6 +284,7 @@ def main() -> None:
                 _LOGGER.info(
                     f"step {step:7d}  loss {loss.item():.4f}  "
                     f"p {loss_p.item():.4f}  d {loss_d.item():.4f}  "
+                    f"vq {vq_loss.item():.4f}  "
                     f"gnorm {gnorm.item():.2f}  "
                     f"lr {optim.param_groups[0]['lr']:.2e}"
                 )
