@@ -14,78 +14,32 @@ over tracks, and only ``is_drum`` matters in the histograms).
 """
 from __future__ import annotations
 
-import csv
-import os
 import random
-from dataclasses import dataclass
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# Make sibling ``utility`` importable.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# --------------------------------------------------------------------------
-# manifest parsing
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class Triplet:
-    item_id: str
-    style_src: str
-    style_tgt: str
-    split: str
-    X_path: str
-    Z_path: str
-    Y_path: str
-
-
-def read_manifest(path: str) -> List[Triplet]:
-    rows: List[Triplet] = []
-    with open(path, "r", newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append(
-                Triplet(
-                    item_id=r["item_id"],
-                    style_src=r["style_src"],
-                    style_tgt=r["style_tgt"],
-                    split=r["split"],
-                    X_path=r["X_path"],
-                    Z_path=r["Z_path"],
-                    Y_path=r.get("Y_path", "") or "",
-                )
-            )
-    return rows
+from hackaton.g2g_pytorch.utility.data import (
+    Triplet,
+    read_manifest,
+    load_roll_bundle,
+    HackathonDataset,
+)
+from hackaton.g2g_pytorch.utility.pianoroll import NUM_PITCHES, T_PER_FRAGMENT
 
 
 # --------------------------------------------------------------------------
 # bundle helpers
 # --------------------------------------------------------------------------
-
-
-def load_bundle(path: str) -> Dict[str, np.ndarray]:
-    with np.load(path) as z:
-        return {
-            "pitched": z["pitched"].astype(np.float32),
-            "drum": z["drum"].astype(np.float32),
-            "track_ids": z["track_ids"].astype(np.int32),
-        }
-
-
-def bundle_to_input(bundle: Dict[str, np.ndarray], num_pitches: int, T: int) -> np.ndarray:
-    """Collapse a bundle into a ``(2, num_pitches, T)`` float32 array."""
-    pitched = bundle["pitched"]
-    drum = bundle["drum"]
-    if pitched.size > 0:
-        p = pitched.max(axis=0)
-    else:
-        p = np.zeros((num_pitches, T), dtype=np.float32)
-    # Pad/crop time if needed (everything is 128 in this dataset but be safe).
-    p = _fit(p, num_pitches, T)
-    d = _fit(drum, num_pitches, T)
-    return np.stack([p, d], axis=0).astype(np.float32)
 
 
 def _fit(roll: np.ndarray, num_pitches: int, T: int) -> np.ndarray:
@@ -98,6 +52,20 @@ def _fit(roll: np.ndarray, num_pitches: int, T: int) -> np.ndarray:
     return roll
 
 
+def bundle_to_input(
+    bundle: Dict[str, np.ndarray],
+    num_pitches: int = NUM_PITCHES,
+    T: int = T_PER_FRAGMENT,
+) -> np.ndarray:
+    """Collapse a bundle into a ``(2, num_pitches, T)`` float32 array."""
+    pitched = bundle["pitched"]
+    drum = bundle["drum"]
+    p = pitched.max(axis=0) if pitched.size > 0 else np.zeros((num_pitches, T), dtype=np.float32)
+    p = _fit(p, num_pitches, T)
+    d = _fit(drum, num_pitches, T)
+    return np.stack([p, d], axis=0).astype(np.float32)
+
+
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------
@@ -106,7 +74,7 @@ def _fit(roll: np.ndarray, num_pitches: int, T: int) -> np.ndarray:
 class HackathonRollDataset(Dataset):
     """Yields ``(X_input, Z_input, Y_pitched, Y_drum, item_id)``.
 
-    ``Y_*`` is ``None`` for test items (no ground truth). Items whose NPZ
+    ``Y_*`` is absent for test items (no ground truth). Items whose NPZ
     files are missing on disk are filtered out at construction time.
     """
 
@@ -114,8 +82,8 @@ class HackathonRollDataset(Dataset):
         self,
         root: str,
         triplets: Sequence[Triplet],
-        num_pitches: int = 128,
-        time_steps: int = 128,
+        num_pitches: int = NUM_PITCHES,
+        time_steps: int = T_PER_FRAGMENT,
         require_Y: bool = True,
     ) -> None:
         self.root = Path(root)
@@ -143,9 +111,9 @@ class HackathonRollDataset(Dataset):
 
     def __getitem__(self, idx: int):
         t = self.triplets[idx]
-        X = bundle_to_input(load_bundle(str(self.root / t.X_path)),
+        X = bundle_to_input(load_roll_bundle(str(self.root / t.X_path)),
                             self.num_pitches, self.time_steps)
-        Z = bundle_to_input(load_bundle(str(self.root / t.Z_path)),
+        Z = bundle_to_input(load_roll_bundle(str(self.root / t.Z_path)),
                             self.num_pitches, self.time_steps)
         sample = {
             "X": torch.from_numpy(X),
@@ -154,8 +122,8 @@ class HackathonRollDataset(Dataset):
             "style_tgt": t.style_tgt,
         }
         if t.Y_path and (self.root / t.Y_path).exists():
-            Y_bundle = load_bundle(str(self.root / t.Y_path))
-            Y = bundle_to_input(Y_bundle, self.num_pitches, self.time_steps)
+            Y = bundle_to_input(load_roll_bundle(str(self.root / t.Y_path)),
+                                self.num_pitches, self.time_steps)
             sample["Y_pitched"] = torch.from_numpy(Y[0])
             sample["Y_drum"] = torch.from_numpy(Y[1])
         return sample
@@ -172,17 +140,13 @@ def split_triplets(
     val_split: str = "val",
     test_split: str = "test",
 ) -> Dict[str, List[Triplet]]:
-    out: Dict[str, List[Triplet]] = {"train": [], "val": [], "test": []}
-    for t in triplets:
-        if t.split == train_split:
-            out["train"].append(t)
-        elif t.split == val_split:
-            out["val"].append(t)
-        elif t.split == test_split:
-            out["test"].append(t)
-    return out
+    return {
+        "train": [t for t in triplets if t.split == train_split],
+        "val":   [t for t in triplets if t.split == val_split],
+        "test":  [t for t in triplets if t.split == test_split],
+    }
 
-
+# not needed
 def carve_val_from_train(
     root: str,
     train: Sequence[Triplet],
@@ -195,20 +159,16 @@ def carve_val_from_train(
     files are present on disk are considered.
     """
     rng = random.Random(seed)
-    present: List[Triplet] = []
-    for t in train:
-        if (
-            (Path(root) / t.X_path).exists()
-            and (Path(root) / t.Z_path).exists()
-            and t.Y_path
-            and (Path(root) / t.Y_path).exists()
-        ):
-            present.append(t)
+    present: List[Triplet] = [
+        t for t in train
+        if (Path(root) / t.X_path).exists()
+        and (Path(root) / t.Z_path).exists()
+        and t.Y_path
+        and (Path(root) / t.Y_path).exists()
+    ]
     rng.shuffle(present)
     k = max(1, int(round(len(present) * fraction)))
-    val = present[:k]
-    keep = present[k:]
-    return keep, val
+    return present[k:], present[:k]
 
 
 def collate(batch: List[dict]) -> Dict[str, torch.Tensor]:
@@ -225,9 +185,11 @@ def collate(batch: List[dict]) -> Dict[str, torch.Tensor]:
 
 
 __all__ = [
+    # re-exported from utility.data
     "Triplet",
     "read_manifest",
-    "load_bundle",
+    "HackathonDataset",
+    # local
     "bundle_to_input",
     "HackathonRollDataset",
     "split_triplets",

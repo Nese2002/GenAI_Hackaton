@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 from typing import Dict, List
 
@@ -19,19 +18,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# Layout: <repo_root>/g2g_pytorch/infer.py  +  <repo_root>/utility/
-_HERE = Path(__file__).resolve().parent
-_REPO_ROOT = _HERE.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from utility import submission as _sub        # type: ignore  # noqa: E402
-from utility import pianoroll as _pr          # type: ignore  # noqa: E402
+from .utility import submission as _sub
+from .utility import pianoroll as _pr
+from .utility.pianoroll import VELOCITY_THRESHOLD
 
 from .config import Config
-from .dataset import (
-    HackathonRollDataset, collate, read_manifest, split_triplets,
-)
+from .dataset import HackathonRollDataset, collate, read_manifest, split_triplets
 from .models import G2GModel
 
 
@@ -43,7 +35,6 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple:
     cfg_dict = ck.get("cfg", {})
     cfg = Config(**{k: v for k, v in cfg_dict.items() if k in Config().__dict__})
     model = G2GModel(cfg).to(device)
-    # Lazy-build the encoders by running one dummy forward, then load state.
     with torch.no_grad():
         dummy = torch.zeros(1, cfg.in_channels, cfg.num_pitches, cfg.num_time_steps, device=device)
         model(dummy, dummy)
@@ -59,9 +50,8 @@ def roll_to_notes_rows(item_id: str, pitched: np.ndarray, drum: np.ndarray,
     notes.extend(_pr.roll_to_notes(pitched, threshold=threshold, is_drum=False, track_id=0))
     notes.extend(_pr.roll_to_notes(drum, threshold=threshold, is_drum=True, track_id=999))
     if not notes:
-        # Submission requires at least one row per item; emit a single quiet
-        # placeholder note so the row exists. The metric will score it poorly
-        # but the CSV will be accepted.
+        # Submission requires at least one row per item; emit a quiet placeholder
+        # so the row exists. The metric will score it poorly but the CSV is accepted.
         notes.append(
             _pr.Note(pitch=60, onset_beats=0.0, duration_beats=0.25, velocity=1,
                      is_drum=False, track_id=0)
@@ -132,11 +122,10 @@ def main() -> None:
                 all_rows.extend(rows)
                 written_ids.add(iid)
 
-    # Sanity: every requested item must appear (even if empty).
+    # Every requested item must appear in the CSV, even if the model produced nothing.
     expected_ids = [t.item_id for t in use]
     for iid in expected_ids:
         if iid not in written_ids:
-            # Should not normally happen, but make sure the CSV has the row.
             all_rows.append({
                 "item_id": iid, "track_id": 0, "is_drum": 0, "pitch": 60,
                 "onset_beats": 0.0, "duration_beats": 0.25, "velocity": 1,
@@ -144,7 +133,6 @@ def main() -> None:
 
     out_path = _sub.write_submission(args.output, all_rows)
     _LOGGER.info(f"Wrote submission to {out_path}")
-    # Round-trip validate.
     df = _sub.validate_submission(out_path, required_item_ids=expected_ids)
     _LOGGER.info(f"Validated submission: {len(df)} note rows across "
                  f"{df['item_id'].nunique() if len(df) else 0} items.")

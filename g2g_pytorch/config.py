@@ -57,14 +57,14 @@ class Config:
 
     # --- training -------------------------------------------------------------
     batch_size: int = 16
-    lr: float = 1e-3
+    lr: float = 5e-4                  # lowered from 1e-3 (NaN at step ~10k otherwise)
     weight_decay: float = 1e-4
-    grad_clip: float = 1.0
+    grad_clip: float = 0.5            # tighter to survive the GRU's occasional spikes
     max_steps: int = 100_000
     log_every: int = 50
     val_every: int = 1000
     ckpt_every: int = 5000
-    pos_weight: float = 30.0          # cells are sparse; upweight positives
+    pos_weight: float = 10.0          # was 30 — too aggressive, caused logit blow-up
     drum_loss_weight: float = 1.0
     pitched_loss_weight: float = 1.0
     seed: int = 42

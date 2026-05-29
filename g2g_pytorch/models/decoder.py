@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utility.pianoroll import NUM_PITCHES, T_PER_FRAGMENT
+
 
 def sinusoidal_positions(T: int, dim: int, device: torch.device) -> torch.Tensor:
     pe = torch.zeros(T, dim, device=device)
@@ -83,7 +85,7 @@ class CrossAttnBlock(nn.Module):
 class RollDecoder(nn.Module):
     """Non-autoregressive roll decoder.
 
-    Returns per-cell logits of shape ``(B, 128, T)`` for pitched and drum.
+    Returns per-cell logits of shape ``(B, NUM_PITCHES, T)`` for pitched and drum.
     """
 
     def __init__(
@@ -93,8 +95,8 @@ class RollDecoder(nn.Module):
         d_model: int,
         num_heads: int,
         num_layers: int,
-        time_steps: int,
-        num_pitches: int,
+        time_steps: int = T_PER_FRAGMENT,
+        num_pitches: int = NUM_PITCHES,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -105,7 +107,6 @@ class RollDecoder(nn.Module):
 
         self.mem_proj = nn.Linear(memory_dim, d_model)
         self.pos_proj = nn.Linear(d_model, d_model)
-        # Learnable query base added on top of positional embeddings.
         self.query_emb = nn.Parameter(torch.randn(time_steps, d_model) * 0.02)
 
         self.blocks = nn.ModuleList([

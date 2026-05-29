@@ -23,8 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-# Make sibling ``utility`` importable.
-# Layout: <repo_root>/g2g_pytorch/train.py  +  <repo_root>/utility/
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -233,6 +231,7 @@ def main() -> None:
         _LOGGER.info(f"Resumed from {args.resume} at step {start_step}")
 
     step = start_step
+    skipped_nan = 0
     model.train()
     while step < cfg.max_steps:
         for batch in train_loader:
@@ -248,9 +247,33 @@ def main() -> None:
             loss_d = soft_bce_loss(logits_d, Yd, cfg.pos_weight)
             loss = cfg.pitched_loss_weight * loss_p + cfg.drum_loss_weight * loss_d
 
+            # NaN guard: a single bad batch corrupts every parameter for the rest
+            # of training. Drop it on the floor instead.
+            if not torch.isfinite(loss):
+                skipped_nan += 1
+                optim.zero_grad(set_to_none=True)
+                _LOGGER.warning(
+                    f"step {step}: non-finite loss (p={loss_p.item():.3g} "
+                    f"d={loss_d.item():.3g}), skipping batch "
+                    f"(total skipped={skipped_nan})"
+                )
+                step += 1
+                continue
+
             optim.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # Belt-and-suspenders: if the gradient itself is non-finite, the
+            # optimizer step would propagate NaN to every parameter. Skip.
+            if not torch.isfinite(gnorm):
+                skipped_nan += 1
+                optim.zero_grad(set_to_none=True)
+                _LOGGER.warning(
+                    f"step {step}: non-finite grad norm, skipping batch "
+                    f"(total skipped={skipped_nan})"
+                )
+                step += 1
+                continue
             optim.step()
             sched.step()
             step += 1
@@ -259,6 +282,7 @@ def main() -> None:
                 _LOGGER.info(
                     f"step {step:7d}  loss {loss.item():.4f}  "
                     f"p {loss_p.item():.4f}  d {loss_d.item():.4f}  "
+                    f"gnorm {gnorm.item():.2f}  "
                     f"lr {optim.param_groups[0]['lr']:.2e}"
                 )
             if step % cfg.val_every == 0 and len(val_ds) > 0 and style_profiles:
@@ -268,17 +292,25 @@ def main() -> None:
                     f"SF={m['SF']:.3f}  HM={m['score']:.3f}"
                 )
             if step % cfg.ckpt_every == 0 or step == cfg.max_steps:
-                ckpt_path = Path(cfg.logdir) / cfg.ckpt_name
-                torch.save({
+                # Write a step-tagged copy AND update the rolling 'model.pt'
+                # alias. The tagged copies survive a future NaN; the alias is
+                # what `--resume model.pt` and `infer --ckpt model.pt` expect.
+                ckpt_dir = Path(cfg.logdir)
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                payload = {
                     "model": model.state_dict(),
                     "optim": optim.state_dict(),
                     "sched": sched.state_dict(),
                     "step": step,
                     "cfg": cfg.__dict__,
-                }, ckpt_path)
-                _LOGGER.info(f"Saved checkpoint to {ckpt_path}")
+                }
+                tagged = ckpt_dir / f"model_{step:07d}.pt"
+                alias = ckpt_dir / cfg.ckpt_name
+                torch.save(payload, tagged)
+                torch.save(payload, alias)
+                _LOGGER.info(f"Saved checkpoint to {tagged} (+ alias {alias.name})")
 
-    _LOGGER.info("Training done.")
+    _LOGGER.info(f"Training done. Skipped {skipped_nan} non-finite batches.")
 
 
 if __name__ == "__main__":
